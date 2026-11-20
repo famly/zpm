@@ -29,7 +29,7 @@ env:
 jobs:
   check:
     name: Checking if a release exists
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     outputs:
       needed: ${{ steps.check.outputs.needed }}
@@ -68,9 +68,9 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
           - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
+            os: ubuntu-24.04
           - target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
+            os: ubuntu-24.04
 
     name: Building ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
@@ -101,7 +101,7 @@ jobs:
     needs: [check, build]
 
     name: Creating the release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     permissions:
       contents: write
@@ -134,10 +134,11 @@ jobs:
             echo
             echo "Commits famly carries on top of upstream:"
             echo
-            git log --no-merges --format='- %h %s' "$base..$SHA"
-            if git log -1 --format=%B "$SHA" | grep -q 'resolved by Claude'; then
+            # --cherry-pick leaves out patches upstream merged under another commit
+            git log --no-merges --cherry-pick --right-only --format='- %h %s' "FETCH_HEAD...$SHA"
+            if git log --merges --format=%B "$base..$SHA" | grep -q 'resolved by Claude'; then
               echo
-              echo "The merge of upstream in $SHA had conflicts that Claude resolved; read that merge commit before pinning this release."
+              echo "Claude resolved conflicts in the last upstream merge; read that merge commit before pinning this release."
             fi
             echo
             echo "Pin it in famly/app with \`scripts/yarn6-trial.sh pin $TAG\`."
