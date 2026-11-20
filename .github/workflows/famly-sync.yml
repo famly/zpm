@@ -1,0 +1,146 @@
+name: Famly upstream sync
+
+# Merges yarnpkg/zpm main into famly once a week. A merge that conflicts goes to Claude, and lands
+# only when Claude resolved every conflict, touched none of famly's own files and the workspace
+# compiles. Every new famly head is released by famly-release.yml.
+on:
+  schedule:
+    - cron: "0 5 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: famly-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  sync:
+    name: Merging upstream main
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    outputs:
+      head: ${{ steps.push.outputs.head }}
+
+    steps:
+      - name: Checkout famly
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: famly
+          fetch-depth: 0
+          # Claude works in this checkout; the push step passes its token itself
+          persist-credentials: false
+
+      - name: Merge upstream main
+        id: merge
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git fetch -q --no-tags https://github.com/yarnpkg/zpm.git main
+          upstream=$(git rev-parse FETCH_HEAD)
+          echo "upstream=$upstream" >>"$GITHUB_OUTPUT"
+
+          if git merge-base --is-ancestor "$upstream" HEAD; then
+            echo "result=current" >>"$GITHUB_OUTPUT"
+          elif git merge --no-edit -m "Merge yarnpkg/zpm main ${upstream:0:12}" "$upstream"; then
+            echo "result=merged" >>"$GITHUB_OUTPUT"
+          else
+            echo "result=conflict" >>"$GITHUB_OUTPUT"
+            git diff --name-only --diff-filter=U
+          fi
+
+      - name: Resolve the conflicts with Claude
+        if: steps.merge.outputs.result == 'conflict'
+        uses: anthropics/claude-code-action@61a9c274fa7110a66dfafc1bbbced03833eb25fe # v1.0.269
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ github.token }}
+          show_full_output: true
+          claude_args: >-
+            --model claude-opus-5-5
+            --allowedTools "Read,Edit,Write,Grep,Glob,Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git add:*),Bash(cargo check:*),Bash(cargo build:*),Bash(cargo test:*)"
+          prompt: |
+            This is famly/zpm, Famly's fork of yarnpkg/zpm (Yarn 6). Its `famly` branch is upstream `main`
+            plus a few patches famly/app needs. The weekly merge of upstream `main` (MERGE_HEAD,
+            ${{ steps.merge.outputs.upstream }}) into `famly` (HEAD) stopped on conflicts. Resolve them.
+
+            1. List the conflicted files with `git diff --name-only --diff-filter=U`.
+            2. For each one, read what upstream changed (`git log -p HEAD...MERGE_HEAD -- <file>`, the
+               MERGE_HEAD side) and what famly's patch changed (the HEAD side), then write a resolution
+               that keeps upstream's change and still does what famly's patch did. When upstream already
+               does what the patch did, take upstream's version.
+            3. Edit only conflicted files, plus the smallest change elsewhere that the resolution needs to
+               compile. Never edit `.github/workflows/famly-*.yml` or `FAMLY.md`.
+            4. `git add` each file once it is resolved.
+            5. Run `cargo check --workspace --locked` and fix what your resolution broke.
+
+            Do not commit, push, abort the merge or switch branches; the workflow commits after checking
+            your work. If a conflict needs a decision about behaviour you cannot make from the code and
+            the history, leave that file unstaged and explain why in your final message.
+
+      - name: Check and commit the resolution
+        if: steps.merge.outputs.result == 'conflict'
+        env:
+          UPSTREAM: ${{ steps.merge.outputs.upstream }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          git rev-parse -q --verify MERGE_HEAD >/dev/null ||
+            { echo "::error::The merge is no longer in progress; Claude committed or aborted it"; exit 1; }
+          unmerged=$(git diff --name-only --diff-filter=U)
+          [[ -z "$unmerged" ]] || { echo "::error::Claude left conflicts in: $unmerged"; exit 1; }
+          git add -u
+          if git diff --cached HEAD | grep -nE '^\+(<<<<<<<|>>>>>>>) '; then
+            echo "::error::The resolution adds conflict markers"
+            exit 1
+          fi
+          git diff --cached --quiet HEAD -- '.github/workflows/famly-*.yml' FAMLY.md ||
+            { echo "::error::The resolution changed famly's own files"; exit 1; }
+          git commit --no-edit -q \
+            -m "Merge yarnpkg/zpm main ${UPSTREAM:0:12}" \
+            -m "Conflicts resolved by Claude in $RUN_URL"
+
+      - name: Cache the Rust build
+        if: steps.merge.outputs.result != 'current'
+        uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+
+      - name: Check that the workspace compiles
+        if: steps.merge.outputs.result != 'current'
+        run: cargo check --workspace --locked
+
+      - name: Push famly
+        id: push
+        if: steps.merge.outputs.result != 'current'
+        env:
+          # GITHUB_TOKEN cannot push commits that change upstream's workflow files; the famlydev token can
+          PUSH_TOKEN: ${{ secrets.FAMLYDEV_GITHUB_TOKEN || github.token }}
+        run: |
+          git push "https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:famly ||
+            { echo "::error::Push refused. If upstream changed a workflow file, famly/zpm needs the FAMLYDEV_GITHUB_TOKEN org secret"; exit 1; }
+          echo "head=$(git rev-parse HEAD)" >>"$GITHUB_OUTPUT"
+
+      # Upstream's workflows benchmark, publish to npm and run on every push; none of them belong
+      # in the fork, and a sync can bring new ones.
+      - name: Keep upstream's workflows off
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow list --repo "$GITHUB_REPOSITORY" --all --json id,path,state \
+            --jq '.[] | select(.state == "active" and (.path | startswith(".github/workflows/")) and (.path | contains("/famly-") | not)) | .id' |
+            while read -r id; do
+              gh workflow disable "$id" --repo "$GITHUB_REPOSITORY"
+            done
+
+  release:
+    needs: sync
+    if: needs.sync.outputs.head != ''
+    permissions:
+      contents: write
+    uses: ./.github/workflows/famly-release.yml
+    with:
+      ref: ${{ needs.sync.outputs.head }}

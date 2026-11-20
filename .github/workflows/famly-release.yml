@@ -1,0 +1,150 @@
+name: Famly release
+
+# Builds the famly branch for the platforms famly/app runs Yarn 6 on, and publishes one GitHub
+# Release per commit. famly/app pins a release and its SHA256SUMS in scripts/yarn6-build.txt, so a
+# new release reaches nobody until that pin moves.
+on:
+  push:
+    branches: [famly]
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: The famly commit to release
+        type: string
+        required: true
+
+# A sync that pushes with a personal token also triggers the push event, so the same commit can
+# arrive twice; the second run waits here and then finds the release already there.
+concurrency:
+  group: famly-release-${{ inputs.ref || github.sha }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Checking if a release exists
+    runs-on: ubuntu-latest
+
+    outputs:
+      needed: ${{ steps.check.outputs.needed }}
+      sha: ${{ steps.check.outputs.sha }}
+      tag: ${{ steps.check.outputs.tag }}
+
+    steps:
+      - name: Checkout the repo
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Check the tag
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha=$(git rev-parse HEAD)
+          tag="famly-$(git show -s --format=%cd --date=format:%Y%m%d HEAD)-${sha:0:12}"
+          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+          echo "tag=$tag" >>"$GITHUB_OUTPUT"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "needed=false" >>"$GITHUB_OUTPUT"
+            echo "$tag is already released"
+          else
+            echo "needed=true" >>"$GITHUB_OUTPUT"
+          fi
+
+  build:
+    if: needs.check.outputs.needed == 'true'
+    needs: check
+
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+
+    name: Building ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout the repo
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ needs.check.outputs.sha }}
+
+      - uses: ./.github/actions/build
+        with:
+          target: ${{ matrix.target }}
+          profile: release-lto-nodebug
+
+      - name: Archive the binaries
+        run: |
+          tar -czf "yarn-${{ matrix.target }}.tar.gz" \
+            -C "target/${{ matrix.target }}/release-lto-nodebug" yarn-bin yarn LICENSE.md
+
+      - name: Upload the archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: yarn-${{ matrix.target }}
+          path: yarn-${{ matrix.target }}.tar.gz
+
+  release:
+    needs: [check, build]
+
+    name: Creating the release
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout the repo
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ needs.check.outputs.sha }}
+          fetch-depth: 0
+
+      - name: Download the archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.check.outputs.sha }}
+          TAG: ${{ needs.check.outputs.tag }}
+        run: |
+          (cd artifacts && sha256sum yarn-*.tar.gz >SHA256SUMS)
+
+          git fetch -q --no-tags https://github.com/yarnpkg/zpm.git main
+          base=$(git merge-base FETCH_HEAD "$SHA")
+          {
+            echo "famly at \`$SHA\`, on top of yarnpkg/zpm@$base."
+            echo
+            echo "Commits famly carries on top of upstream:"
+            echo
+            git log --no-merges --format='- %h %s' "$base..$SHA"
+            if git log -1 --format=%B "$SHA" | grep -q 'resolved by Claude'; then
+              echo
+              echo "The merge of upstream in $SHA had conflicts that Claude resolved; read that merge commit before pinning this release."
+            fi
+            echo
+            echo "Pin it in famly/app with \`scripts/yarn6-trial.sh pin $TAG\`."
+          } >notes.md
+
+          gh release create "$TAG" artifacts/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$SHA" \
+            --title "$TAG" \
+            --notes-file notes.md
