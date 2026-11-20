@@ -136,7 +136,7 @@ jobs:
             echo
             # --cherry-pick leaves out patches upstream merged under another commit
             git log --no-merges --cherry-pick --right-only --format='- %h %s' "FETCH_HEAD...$SHA"
-            if git log --merges --format=%B "$base..$SHA" | grep -q 'resolved by Claude'; then
+            if git log -1 --merges --first-parent --format=%B "$SHA" | grep -q 'resolved by Claude'; then
               echo
               echo "Claude resolved conflicts in the last upstream merge; read that merge commit before pinning this release."
             fi
