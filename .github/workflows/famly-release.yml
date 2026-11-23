@@ -125,6 +125,14 @@ jobs:
           SHA: ${{ needs.check.outputs.sha }}
           TAG: ${{ needs.check.outputs.tag }}
         run: |
+          # Only famly's head is released. GITHUB_TOKEN cannot tag an older commit that changes a
+          # workflow file, and an older release would also become the latest one.
+          head=$(git ls-remote origin refs/heads/famly | cut -f1)
+          if [[ "$head" != "$SHA" ]]; then
+            echo "::notice::famly is at ${head:0:12} now, so its release covers ${SHA:0:12}"
+            exit 0
+          fi
+
           (cd artifacts && sha256sum yarn-*.tar.gz >SHA256SUMS)
 
           git fetch -q --no-tags https://github.com/yarnpkg/zpm.git main
